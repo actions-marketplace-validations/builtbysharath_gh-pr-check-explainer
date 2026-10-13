@@ -84,7 +84,7 @@ function eventFilter(event, config, snapshot) {
     const results = snapshot.files.data.map(file => matchPatterns(file, config.paths || config['paths-ignore']));
     if (results.some(result => result === null)) return {state: 'unknown'};
     if (config.paths ? !results.some(Boolean) : results.every(Boolean)) {
-      reasons.push('The ' + event + ' path filter excludes all ' + results.length + ' changed files.');
+      reasons.push('The ' + event + ' path filter excludes ' + (results.length === 1 ? 'the 1 changed file.' : 'all ' + results.length + ' changed files.'));
     }
   }
   return {state: reasons.length ? 'excluded' : 'eligible', reasons};
@@ -164,6 +164,7 @@ export function analyze(snapshot) {
   const workflows = (snapshot.workflows?.data || []).map(file => workflowInfo(file, snapshot.repository, snapshot.pr.headSha));
   const baseWorkflows = (snapshot.baseWorkflows?.data || []).map(file => workflowInfo(file, snapshot.repository, snapshot.pr.baseSha || snapshot.pr.baseBranch));
   for (const workflow of workflows.filter(item => item.error)) limitations.push(workflow.path + ': ' + workflow.error);
+  for (const workflow of baseWorkflows.filter(item => item.error)) limitations.push('Base branch ' + workflow.path + ': ' + workflow.error);
   const checks = policyChecks(snapshot).map(required => {
     const matching = runs.filter(run => run.name === required.context);
     const correctSource = matching.filter(run => !required.appId || run.appId === required.appId);
