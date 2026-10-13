@@ -21,12 +21,12 @@ gh extension install builtbysharath/gh-pr-check-explainer
 gh pr-check-explainer https://github.com/OWNER/REPO/pull/NUMBER
 ```
 
-The extension runs a committed single-file build of this source (`dist/`, rebuilt and compared in CI), so there is no npm install step. It follows `main`; add `--pin v0.2.0` to stay on a release. Update with `gh extension upgrade pr-check-explainer` or remove with `gh extension remove pr-check-explainer`. The tool uses your existing `gh` access to read GitHub data. It does not rerun workflows, post comments or change repository settings.
+The extension runs a committed single-file build of this source (`dist/`, rebuilt and compared in CI), so there is no npm install step. It follows `main`; add `--pin v0.3.0` to stay on a release. Update with `gh extension upgrade pr-check-explainer` or remove with `gh extension remove pr-check-explainer`. The tool uses your existing `gh` access to read GitHub data. It does not rerun workflows, post comments or change repository settings.
 
 Prefer not to install anything? Run the pinned release once through npm:
 
 ```sh
-npm exec --yes --package=https://github.com/builtbysharath/gh-pr-check-explainer/releases/download/v0.2.0/gh-pr-check-explainer-0.2.0.tgz -- gh-pr-check-explainer https://github.com/OWNER/REPO/pull/NUMBER
+npm exec --yes --package=https://github.com/builtbysharath/gh-pr-check-explainer/releases/download/v0.3.0/gh-pr-check-explainer-0.3.0.tgz -- gh-pr-check-explainer https://github.com/OWNER/REPO/pull/NUMBER
 ```
 
 npm downloads the GitHub release package and its dependencies. The package is not published to the npm registry.
@@ -78,6 +78,25 @@ When a required check can't report because of configuration, the action posts on
 Outputs: `verdict` (`blocked`, `unknown`, `satisfied` or `none`) and `stuck-checks` (a JSON array of check names).
 
 Apart from that one comment, the action only reads. The workflow token has no admin access, so classic branch protection is read from the branch summary, which doesn't say whether branches must be up to date. On `pull_request`, pull requests from forks get a read-only token: the action then skips the comment with a warning, and the job summary still has the report.
+
+## Audit a branch before a pull request gets stuck
+
+`--audit` compares a branch's required checks with the workflows on that branch. No pull request is needed:
+
+```sh
+gh pr-check-explainer --audit OWNER/REPO
+gh pr-check-explainer --audit OWNER/REPO --branch release/1.x --format json
+```
+
+It flags required checks that some pull requests would wait for:
+
+- The workflow that reports the check has a `paths`, `branches` or `types` filter on `pull_request`.
+- The workflow runs only on `push`, so pull requests from forks never get the check, or only on events that can't satisfy a pull request requirement.
+- No workflow has a job with that name, and the rule requires GitHub Actions.
+- Several workflows report the same name.
+- The branch uses a merge queue, and the workflow has no `merge_group` trigger or `push` trigger that runs on the queue's `gh-readonly-queue/` branches.
+
+Exit code `1` means at least one risk was found. Checks from other GitHub Apps are listed as not checked. Checks whose job names come from dynamic matrices or reusable workflows stay unknown.
 
 ## What you get
 
