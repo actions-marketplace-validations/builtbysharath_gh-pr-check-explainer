@@ -9152,6 +9152,81 @@ var import_picomatch = __toESM(require_picomatch2(), 1);
 var PASS = /* @__PURE__ */ new Set(["success", "neutral", "skipped"]);
 var PR_EVENTS = /* @__PURE__ */ new Set(["push", "pull_request", "pull_request_review", "pull_request_target", "deployment", "deployment_status"]);
 var DOCS = "https://docs.github.com/en/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks";
+var MAX_MATRIX_JOBS = 256;
+function hasExpression(value) {
+  return typeof value === "string" ? value.includes("${{") : Array.isArray(value) ? value.some(hasExpression) : value !== null && typeof value === "object" && Object.values(value).some(hasExpression);
+}
+function hasNull(value) {
+  return value === null || value === void 0 || typeof value === "object" && Object.values(value).some(hasNull);
+}
+function leaves(value) {
+  return value !== null && typeof value === "object" ? Object.values(value).flatMap(leaves) : [String(value)];
+}
+function same(a, b) {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+function lowerKeys(entry) {
+  return Object.fromEntries(Object.entries(entry).map(([key, value]) => [key.toLowerCase(), value]));
+}
+function property(object, key) {
+  if (object === null || typeof object !== "object") return void 0;
+  const own = Object.keys(object).find((name) => name.toLowerCase() === key.toLowerCase());
+  return own === void 0 ? void 0 : object[own];
+}
+function matrixCombinations(matrix) {
+  if (!matrix || typeof matrix !== "object" || Array.isArray(matrix) || hasExpression(matrix) || hasNull(matrix)) return null;
+  const { include: includes = [], exclude: excludes = [], ...variables } = matrix;
+  const axes = lowerKeys(variables);
+  const keys = Object.keys(axes);
+  if (!Array.isArray(includes) || !Array.isArray(excludes) || keys.some((key) => !Array.isArray(axes[key]) || !axes[key].length)) return null;
+  if (keys.reduce((count, key) => count * axes[key].length, 1) > MAX_MATRIX_JOBS) return null;
+  let combinations = keys.length ? [{}] : [];
+  for (const key of keys) combinations = combinations.flatMap((combination) => axes[key].map((value) => ({ ...combination, [key]: value })));
+  for (const entry of [...includes, ...excludes]) if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
+  const include = includes.map(lowerKeys), exclude = excludes.map(lowerKeys);
+  combinations = combinations.filter((combination) => !exclude.some((entry) => Object.entries(entry).every(([key, value]) => same(combination[key], value))));
+  const results = combinations.map((values) => ({ values, shown: keys.map((key) => values[key]) }));
+  const originals = results.length;
+  for (const entry of include) {
+    let added = false;
+    for (const result of results.slice(0, originals)) {
+      if (Object.entries(entry).every(([key, value]) => !keys.includes(key) || same(result.values[key], value))) {
+        Object.assign(result.values, entry);
+        added = true;
+      }
+    }
+    if (!added) results.push({ values: { ...entry }, shown: Object.values(entry) });
+  }
+  return results.length > MAX_MATRIX_JOBS || results.some((result) => !result.shown.length) ? null : results;
+}
+function jobCheckNames(id, job) {
+  if (!job || typeof job !== "object" || job.uses) return null;
+  const name = job.name || id;
+  if (typeof name !== "string") return null;
+  const matrix = job.strategy?.matrix;
+  if (matrix === void 0) return hasExpression(name) ? null : [name];
+  const combinations = matrixCombinations(matrix);
+  if (!combinations) return null;
+  if (!hasExpression(name)) return [...combinations.map(({ shown }) => name + " (" + shown.flatMap(leaves).join(", ") + ")"), ...job.if === void 0 ? [] : [name]];
+  const parts = name.split(/(\$\{\{[\s\S]*?\}\})/);
+  const paths = parts.map((part, index) => index % 2 ? part.match(/^\$\{\{\s*matrix((?:\.[A-Za-z_][\w-]*)+)\s*\}\}$/)?.[1].slice(1).split(".") : null);
+  if (paths.some((path, index) => index % 2 && !path)) return null;
+  const names = [];
+  for (const { values } of combinations) {
+    let text = "";
+    for (let index = 0; index < parts.length; index++) {
+      if (index % 2 === 0) {
+        text += parts[index];
+        continue;
+      }
+      const value = paths[index].reduce(property, values);
+      if (value !== null && typeof value === "object") return null;
+      text += value === void 0 ? "" : String(value);
+    }
+    names.push(text);
+  }
+  return names;
+}
 function workflowInfo(file, repository, sha) {
   const lines = new import_yaml.LineCounter();
   try {
@@ -9165,14 +9240,15 @@ function workflowInfo(file, repository, sha) {
     let dynamic = false;
     for (const [id, job] of Object.entries(jobs)) {
       if (!job || typeof job !== "object") continue;
-      const name = job.name || id;
-      if (job.uses || job.strategy?.matrix || typeof name !== "string" || name.includes("${{")) {
+      const checkNames = jobCheckNames(id, job);
+      if (!checkNames) {
         dynamic = true;
         continue;
       }
       const node = doc.get("jobs", true)?.get?.(id, true);
       const nameNode = node?.get?.("name", true) || node;
-      names.push({ name, line: lines.linePos(nameNode?.range?.[0] || 0).line });
+      const line2 = lines.linePos(nameNode?.range?.[0] || 0).line;
+      names.push(...checkNames.map((name) => ({ name, line: line2 })));
     }
     const onNode = doc.contents?.items?.find((pair) => pair.key?.value === "on")?.key || doc.get("on", true);
     const line = lines.linePos(onNode?.range?.[0] || 0).line;
@@ -9392,6 +9468,14 @@ function analyze(snapshot) {
     const producers = workflows.filter((file) => file.names.some((job) => job.name === required.context));
     if (producers.length === 1) {
       const workflow = producers[0];
+      const waiting = (snapshot.runs?.data || []).find((run2) => run2.path === workflow.path && run2.conclusion === "action_required");
+      if (waiting) {
+        row.cause = "workflow_awaiting_approval";
+        if (row.code !== "passed_on_other_commit") row.code = row.cause;
+        evidence.push({ label: workflow.path + " run \xB7 action_required", url: waiting.url || null, detail: "Event " + waiting.event });
+        details.push("The run of " + workflow.path + " for this commit is waiting for a maintainer to approve workflows" + (snapshot.pr.fork ? " from this fork" : "") + ".");
+        return row;
+      }
       const filter = workflowFilter(workflow, snapshot);
       evidence.push({ label: workflow.path, url: workflow.url + "#L" + workflow.line, detail: "Workflow event configuration" });
       if (filter.state === "excluded" || filter.state === "unsupported_event") {
@@ -9584,7 +9668,9 @@ async function collect(repository, number, request = ghRequest) {
     event: run2.event,
     path: run2.path,
     suiteId: run2.check_suite_id,
-    url: run2.html_url
+    url: run2.html_url,
+    status: run2.status,
+    conclusion: run2.conclusion
   })) } : runsResult;
   const headRoot = pr.head.repo?.full_name && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(pr.head.repo.full_name) ? "repos/" + pr.head.repo.full_name : root;
   const workflows = await readWorkflows(request, headRoot, pr.head.sha);
@@ -9682,7 +9768,8 @@ var STUCK = {
   workflow_has_no_pr_event: { why: "The workflow that reports it has no pull request event.", fix: "Add a `pull_request` trigger to that workflow, or require a different check." },
   job_removed_or_renamed: { why: "This PR removes or renames the job that reports it.", fix: "Keep the job name, or update the required check in the branch rule when this PR merges." },
   wrong_reporting_app: { why: "A check with this name comes from a different GitHub App than the rule requires.", fix: "Change the app the rule expects, or report the check from the expected app." },
-  ineligible_workflow_event: { why: "Its only result comes from an event that cannot satisfy a pull request requirement.", fix: "Run the job on `pull_request` as well." }
+  ineligible_workflow_event: { why: "Its only result comes from an event that cannot satisfy a pull request requirement.", fix: "Run the job on `pull_request` as well." },
+  workflow_awaiting_approval: { why: "Its workflow run is waiting for a maintainer to approve workflows from this fork.", fix: "A maintainer can approve the run from the Checks section of this pull request." }
 };
 function headers(token, json) {
   return {
